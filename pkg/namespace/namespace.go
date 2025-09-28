@@ -4,19 +4,32 @@ import (
     "fmt"
     "os"
     "os/exec"
+    "strings"
     "syscall"
 )
 
-func RunInNewNamespace(command []string, rootfsPath string) error {
+func RunInNewNamespaceWithCgroup(command []string, rootfsPath, containerID string) error {
     if rootfsPath == "" {
         return fmt.Errorf("rootfs path required")
     }
     
-    // Very simple, safe approach - no risky mount operations
-    cmd := exec.Command("chroot", rootfsPath, command[0])
-    if len(command) > 1 {
-        cmd.Args = append([]string{"chroot", rootfsPath}, command...)
+    // Create a wrapper script that will add itself to cgroup
+    script := fmt.Sprintf(`#!/bin/bash
+# Add current process to cgroup
+echo $$ > /sys/fs/cgroup/minidocker-%s/cgroup.procs 2>/dev/null || true
+# Execute the container command
+exec chroot %s %s
+`, containerID, rootfsPath, strings.Join(command, " "))
+    
+    // Write script to temporary file
+    tmpScript := "/tmp/container_wrapper.sh"
+    if err := os.WriteFile(tmpScript, []byte(script), 0755); err != nil {
+        return fmt.Errorf("failed to create wrapper script: %v", err)
     }
+    defer os.Remove(tmpScript)
+    
+    // Execute the wrapper script
+    cmd := exec.Command("/bin/bash", tmpScript)
     
     cmd.SysProcAttr = &syscall.SysProcAttr{
         Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS,
@@ -27,4 +40,9 @@ func RunInNewNamespace(command []string, rootfsPath string) error {
     cmd.Stderr = os.Stderr
     
     return cmd.Run()
+}
+
+// Legacy function for backward compatibility
+func RunInNewNamespace(command []string, rootfsPath string) error {
+    return RunInNewNamespaceWithCgroup(command, rootfsPath, "")
 }
