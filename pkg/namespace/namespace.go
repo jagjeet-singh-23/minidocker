@@ -1,43 +1,30 @@
 package namespace
 
 import (
-	"fmt"
-	"os"
-	"os/exec"
-	"strings"
-	"syscall"
+    "fmt"
+    "os"
+    "os/exec"
+    "syscall"
 )
 
-// RunInNewNamespace runs a command in new PID and mount namespace
 func RunInNewNamespace(command []string, rootfsPath string) error {
-	var cmd *exec.Cmd
-	var script string
-
-	if rootfsPath == "" {
-		// Original behaviour without rootfs (host filesystem)
-		script = "mount -t proc proc /proc 2>dev/null && exec " + strings.Join(command, " ")
-	} else {
-		// Create /proc directory in rootfs if it does not exits
-		os.MkdirAll(rootfsPath+"/proc", 0755)
-
-		// Use chroot with the provided rootfs (Container filesystem)
-		script = fmt.Sprintf(`
-			mount -t proc proc %[1]s/proc 2>dev/null || true
-			chroot %[1]s %[2]s
-		`, rootfsPath, strings.Join(command, " "))
-	}
-
-	cmd = exec.Command("sh", "-c", script)
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID |
-			    syscall.CLONE_NEWNS |
-			    syscall.CLONE_NEWUTS,
-	}
-
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	return cmd.Run()
+    if rootfsPath == "" {
+        return fmt.Errorf("rootfs path required")
+    }
+    
+    // Very simple, safe approach - no risky mount operations
+    cmd := exec.Command("chroot", rootfsPath, command[0])
+    if len(command) > 1 {
+        cmd.Args = append([]string{"chroot", rootfsPath}, command...)
+    }
+    
+    cmd.SysProcAttr = &syscall.SysProcAttr{
+        Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS,
+    }
+    
+    cmd.Stdin = os.Stdin
+    cmd.Stdout = os.Stdout
+    cmd.Stderr = os.Stderr
+    
+    return cmd.Run()
 }
