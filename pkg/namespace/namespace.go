@@ -1,6 +1,7 @@
 package namespace
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"

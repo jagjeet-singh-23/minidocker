@@ -24,7 +24,7 @@ func GetImageRootfs(imageName string) (string, error) {
 		return "", fmt.Errorf("image %s not found", imageName)
 	}
 
-	return filepath.Join(imageBasePath, imageName, "rootfs")
+	return filepath.Join(imageBasePath, imageName, "rootfs"), nil
 }
 
 // ListImages returns all the available images
