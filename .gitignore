@@ -1,0 +1,53 @@
+# Binaries for programs and plugins
+/bin/
+/build/
+/dist/
+/out/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, coverage files
+*.test
+*.cover
+coverage.out
+
+# Output of go build
+*.o
+*.a
+
+# Dependency directories (remove if you vendor intentionally)
+/vendor/
+Godeps/
+
+# Go workspace
+/pkg/mod/
+*.modcache
+
+# Go specific
+*.log
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Generated files
+**/*_gen.go
+
