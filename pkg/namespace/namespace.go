@@ -13,22 +13,29 @@ func RunInNewNamespaceWithCgroup(command []string, rootfsPath, containerID strin
         return fmt.Errorf("rootfs path required")
     }
     
-    // Create a wrapper script that will add itself to cgroup
-    script := fmt.Sprintf(`#!/bin/bash
-# Add current process to cgroup
-echo $$ > /sys/fs/cgroup/minidocker-%s/cgroup.procs 2>/dev/null || true
-# Execute the container command
-exec chroot %s %s
-`, containerID, rootfsPath, strings.Join(command, " "))
+    // Create a wrapper script
+    cgroupAdd := ""
+    if containerID != "" {
+        // Only add to cgroup if it exists
+        cgroupPath := fmt.Sprintf("/sys/fs/cgroup/minidocker-%s", containerID)
+        cgroupAdd = fmt.Sprintf(`
+if [ -d "%s" ]; then
+    echo $$ > %s/cgroup.procs 2>/dev/null || true
+fi
+`, cgroupPath, cgroupPath)
+    }
     
-    // Write script to temporary file
+    script := fmt.Sprintf(`#!/bin/bash
+%s
+exec chroot %s %s
+`, cgroupAdd, rootfsPath, strings.Join(command, " "))
+    
     tmpScript := "/tmp/container_wrapper.sh"
     if err := os.WriteFile(tmpScript, []byte(script), 0755); err != nil {
         return fmt.Errorf("failed to create wrapper script: %v", err)
     }
     defer os.Remove(tmpScript)
     
-    // Execute the wrapper script
     cmd := exec.Command("/bin/bash", tmpScript)
     
     cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -42,7 +49,6 @@ exec chroot %s %s
     return cmd.Run()
 }
 
-// Legacy function for backward compatibility
 func RunInNewNamespace(command []string, rootfsPath string) error {
     return RunInNewNamespaceWithCgroup(command, rootfsPath, "")
 }
