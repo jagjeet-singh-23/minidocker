@@ -4,6 +4,8 @@ import (
     "flag"
     "fmt"
     "os"
+    "os/exec"
+    "strconv"
     "syscall"
     "text/tabwriter"
     "time"
@@ -23,6 +25,7 @@ func main() {
         fmt.Println("  rm <container-id>                                         - Remove a container")
         fmt.Println("  logs <container-id>                                       - Show container logs")
         fmt.Println("  images                                                    - List available images")
+	fmt.Println("  exec <container-id> <command>				 - Execute command in running container")
         os.Exit(1)
     }
 
@@ -41,6 +44,8 @@ func main() {
     	    showLogs()
     case "images":
         listImages()
+    case "exec":
+	    execContainer()
     default:
         fmt.Printf("Unknown command: %s\n", command)
         os.Exit(1)
@@ -68,8 +73,8 @@ func runContainer() {
     // Get image rootfs path
     rootfsPath, err := image.GetImageRootfs(imageName)
     if err != nil {
-	    fmt.Println("Error: %v\n", err)
-	    os.Exit(1)
+        fmt.Printf("Error: %v\n", err)
+        os.Exit(1)
     }
 
     // Create container metadata
@@ -77,34 +82,37 @@ func runContainer() {
     logPath := fmt.Sprintf("/var/lib/minidocker/containers/%s.log", containerID)
 
     containerInfo := &container.Container{
-	    ID: containerID,
-	    Name: containerID,  // todo: update container name
-	    Image: imageName,
-	    Command: command,
-	    State: container.StateCreated,
-	    Created: time.Now(),
-	    LogPath: logPath,
+        ID: containerID,
+        Name: containerID,
+        Image: imageName,
+        Command: command,
+        State: container.StateCreated,
+        Created: time.Now(),
+        LogPath: logPath,
     }
 
     if err := container.SaveContainer(containerInfo); err != nil {
-	    fmt.Printf("Error saving container: %v\n", err)
-	    os.Exit(1)
+        fmt.Printf("Error saving container: %v\n", err)
+        os.Exit(1)
     }
 
     fmt.Printf("Container %s created\n", containerID)
     
     if *memoryMB > 0 || *cpuCores > 0 {
-	    limits := cgroup.ContainerLimits{
-		    MemoryMB: *memoryMB,
-		    CPUQuota: *cpuCores,
-	    }
+        limits := cgroup.ContainerLimits{
+            MemoryMB: *memoryMB,
+            CPUQuota: *cpuCores,
+        }
 
-	    if err := cgroup.CreateCgroupForContainer(containerID, limits); err != nil {
-		    fmt.Printf("Error creating cgroup: %v\n", err)
-		    os.Exit(1)
-	    }
-
-	    defer cgroup.RemoveCgroup(containerID)
+        if err := cgroup.CreateCgroupForContainer(containerID, limits); err != nil {
+            fmt.Printf("Error creating cgroup: %v\n", err)
+            os.Exit(1)
+        }
+        
+        // Don't defer if detached - let goroutine handle cleanup
+        if !*detach {
+            defer cgroup.RemoveCgroup(containerID)
+        }
     }
 
     // Update state to running
@@ -112,22 +120,70 @@ func runContainer() {
     containerInfo.Started = time.Now()
     container.SaveContainer(containerInfo)
 
+    // Run container and capture PID
+    pid, err := namespace.RunInNewNamespaceWithCgroup(command, rootfsPath, containerID)
+    
+    if err != nil {
+        fmt.Printf("Error starting container: %v\n", err)
+        os.Exit(1)
+    }
+    
+    // Save PID immediately
+    containerInfo.PID = pid
+    container.SaveContainer(containerInfo)
+    
     if *detach {
-	    fmt.Printf("Starting contianer %s in background\n", containerID)
-	    // todo: handle background execution
+        // Detach mode - run in goroutine
+        fmt.Printf("Container %s started in background with PID %d\n", containerID[:12], pid)
+        
+        // Start goroutine to monitor container
+        go func() {
+            // Wait for container to finish
+            process, _ := os.FindProcess(pid)
+            processState, waitErr := process.Wait()
+            
+            exitCode := 0
+            if waitErr != nil {
+                exitCode = 1
+            } else if processState != nil && !processState.Success() {
+                exitCode = processState.ExitCode()
+            }
+            
+            // Update final state
+            containerInfo.State = container.StateExited
+            containerInfo.Finished = time.Now()
+            containerInfo.ExitCode = exitCode
+            containerInfo.PID = 0
+            container.SaveContainer(containerInfo)
+            
+            // Cleanup cgroup
+            if *memoryMB > 0 || *cpuCores > 0 {
+                cgroup.RemoveCgroup(containerID)
+            }
+        }()
+        
+        // Return immediately, don't wait
+        return
     }
-
-    // Run container
+    
+    // Foreground mode - wait for completion
+    fmt.Printf("Container running with PID %d\n", pid)
+    process, _ := os.FindProcess(pid)
+    processState, err := process.Wait()
+    
     exitCode := 0
-    if err := namespace.RunInNewNamespaceWithCgroup(command, rootfsPath, containerID); err != nil {
-	    fmt.Printf("Container exited with error: %v\n", err)
-	    exitCode = 1
+    if err != nil {
+        fmt.Printf("Container exited with error: %v\n", err)
+        exitCode = 1
+    } else if processState != nil && !processState.Success() {
+        exitCode = processState.ExitCode()
     }
-
+    
     // Update final state
     containerInfo.State = container.StateExited
     containerInfo.Finished = time.Now()
     containerInfo.ExitCode = exitCode
+    containerInfo.PID = 0
     container.SaveContainer(containerInfo)
 }
 
@@ -257,3 +313,49 @@ func listImages() {
     }
 }
 
+func execContainer() {
+	if len(os.Args) < 4 {
+		fmt.Println("Usage: minidocker exec <container-id> <command>")
+		os.Exit(1)
+	}
+
+	containerID := os.Args[2]
+	command := os.Args[3:]
+
+	// Find the container by prefix
+	containerInfo, err := container.FindContainerByPrefix(containerID)
+	if err != nil {
+		fmt.Printf(
+			"Container %s is not running (state: %s)\n", 
+			containerInfo.ID[:12], 
+			containerInfo.State,
+		)
+		os.Exit(1)
+	}
+
+	if containerInfo.State != container.StateRunning {
+		fmt.Printf("Container %s is not running (state: %s)\n", containerInfo.ID[:12], containerInfo.State)
+		os.Exit(1)
+	}
+
+	// Use the nsenter command to enter the container namespace
+	nsenterArgs := []string{
+		"nsenter",
+		"--target",
+		strconv.Itoa(containerInfo.PID),
+		"--pid",
+		"--uts",
+		"--mount",
+	}
+	nsenterArgs = append(nsenterArgs, command...)
+
+	cmd := exec.Command(nsenterArgs[0], nsenterArgs[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("Error executing command:  %v\n", err)
+		os.Exit(1)
+	}
+}

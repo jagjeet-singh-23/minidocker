@@ -6,17 +6,16 @@ import (
     "os/exec"
     "strings"
     "syscall"
+    "time"
 )
 
-func RunInNewNamespaceWithCgroup(command []string, rootfsPath, containerID string) error {
+func RunInNewNamespaceWithCgroup(command []string, rootfsPath, containerID string) (int, error) {
     if rootfsPath == "" {
-        return fmt.Errorf("rootfs path required")
+        return 0, fmt.Errorf("rootfs path required")
     }
     
-    // Create a wrapper script
     cgroupAdd := ""
     if containerID != "" {
-        // Only add to cgroup if it exists
         cgroupPath := fmt.Sprintf("/sys/fs/cgroup/minidocker-%s", containerID)
         cgroupAdd = fmt.Sprintf(`
 if [ -d "%s" ]; then
@@ -32,7 +31,7 @@ exec chroot %s %s
     
     tmpScript := "/tmp/container_wrapper.sh"
     if err := os.WriteFile(tmpScript, []byte(script), 0755); err != nil {
-        return fmt.Errorf("failed to create wrapper script: %v", err)
+        return 0, fmt.Errorf("failed to create wrapper script: %v", err)
     }
     defer os.Remove(tmpScript)
     
@@ -46,9 +45,20 @@ exec chroot %s %s
     cmd.Stdout = os.Stdout
     cmd.Stderr = os.Stderr
     
-    return cmd.Run()
+    // Start the process
+    if err := cmd.Start(); err != nil {
+        return 0, err
+    }
+    
+    pid := cmd.Process.Pid
+    
+    // Give process time to enter namespaces
+    time.Sleep(100 * time.Millisecond)
+    
+    return pid, nil
 }
 
 func RunInNewNamespace(command []string, rootfsPath string) error {
-    return RunInNewNamespaceWithCgroup(command, rootfsPath, "")
+    _, err := RunInNewNamespaceWithCgroup(command, rootfsPath, "")
+    return err
 }
