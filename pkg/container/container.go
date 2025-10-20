@@ -31,6 +31,8 @@ type Container struct {
     Started     time.Time         `json:"started"`
     Finished    time.Time         `json:"finished"`
     LogPath     string            `json:"log_path"`
+    IPAddress   string            `json:"ip_address"`
+    NetworkMode string            `json:"network_mode"`
 }
 
 // SaveContainer persists container metadata

@@ -13,19 +13,20 @@ import (
     "github.com/jagjeet-singh-23/minidocker/pkg/container"
     "github.com/jagjeet-singh-23/minidocker/pkg/image"
     "github.com/jagjeet-singh-23/minidocker/pkg/namespace"
+    "github.com/jagjeet-singh-23/minidocker/pkg/network"
 )
 
 func main() {
     if len(os.Args) < 2 {
         fmt.Println("Usage: minidocker <command> [args...]")
         fmt.Println("Commands:")
-        fmt.Println("  run [--memory=MB] [--cpu=CORES] [-d] <image> <command>    - Run a container")
-        fmt.Println("  ps                                                        - List containers")
-        fmt.Println("  stop <container-id>                                       - Stop a container")
-        fmt.Println("  rm <container-id>                                         - Remove a container")
-        fmt.Println("  logs <container-id>                                       - Show container logs")
-        fmt.Println("  images                                                    - List available images")
-	fmt.Println("  exec <container-id> <command>				 - Execute command in running container")
+        fmt.Println("  run [--memory=MB] [--cpu=CORES] [--net=MODE] [-d] <image> <command>    - Run a container")
+        fmt.Println("  ps                                                                     - List containers")
+        fmt.Println("  stop <container-id>                                                    - Stop a container")
+        fmt.Println("  rm <container-id>                                                      - Remove a container")
+        fmt.Println("  logs <container-id>                                                    - Show container logs")
+        fmt.Println("  images                                                                 - List available images")
+	fmt.Println("  exec <container-id> <command>				              - Execute command in running container")
         os.Exit(1)
     }
 
@@ -58,6 +59,7 @@ func runContainer() {
     memoryMB := runCmd.Int("memory", 0, "Memory limit in MB")
     cpuCores := runCmd.Float64("cpu", 0, "CPU limit (e.g., 0.5 for half a core)")
     detach := runCmd.Bool("d", false, "Run container in background")
+    networkMode := runCmd.String("net", "bridge", "Network mode (bridge or none)")
     
     runCmd.Parse(os.Args[2:])
     
@@ -69,6 +71,12 @@ func runContainer() {
     
     imageName := args[0]
     command := args[1:]
+
+    // Validate network mode
+    if *networkMode != "bridge" && *networkMode != "none" {
+	    fmt.Printf("Invalid network mode: %s (use 'bridge' or 'none')", *networkMode)
+	    os.Exit(1)
+    }
 
     // Get image rootfs path
     rootfsPath, err := image.GetImageRootfs(imageName)
@@ -89,6 +97,7 @@ func runContainer() {
         State: container.StateCreated,
         Created: time.Now(),
         LogPath: logPath,
+	NetworkMode: *networkMode,
     }
 
     if err := container.SaveContainer(containerInfo); err != nil {
@@ -115,13 +124,22 @@ func runContainer() {
         }
     }
 
+    // Setup bridge network if needed
+    enableNetwork := *networkMode == "bridge"
+    if enableNetwork {
+	    if err := network.SetupBridge(); err != nil {
+		    fmt.Printf("Error setting up bridge: %v\n", err)
+		    os.Exit(1)
+	    }
+    }
+
     // Update state to running
     containerInfo.State = container.StateRunning
     containerInfo.Started = time.Now()
     container.SaveContainer(containerInfo)
 
     // Run container and capture PID
-    pid, err := namespace.RunInNewNamespaceWithCgroup(command, rootfsPath, containerID)
+    pid, err := namespace.RunInNewNamespaceWithCgroup(command, rootfsPath, containerID, enableNetwork)
     
     if err != nil {
         fmt.Printf("Error starting container: %v\n", err)
@@ -131,6 +149,18 @@ func runContainer() {
     // Save PID immediately
     containerInfo.PID = pid
     container.SaveContainer(containerInfo)
+
+    // Setup container network if bridge mode
+    if enableNetwork {
+	    containerIP, err := network.SetupContainerNetwork(containerID, pid)
+	    if err != nil {
+		    fmt.Printf("Warning: failed to setup network: %v\n", err)
+	    } else {
+		    containerInfo.IPAddress = containerIP
+		    container.SaveContainer(containerInfo)
+		    fmt.Printf("Container network configured with IP: %s\n", containerIP)
+	    }
+    }
     
     if *detach {
         // Detach mode - run in goroutine
@@ -148,12 +178,18 @@ func runContainer() {
             } else if processState != nil && !processState.Success() {
                 exitCode = processState.ExitCode()
             }
+
+	    // Cleanup network
+	    if enableNetwork {
+		    network.CleanupContainerNetwork(containerID)
+	    }
             
             // Update final state
             containerInfo.State = container.StateExited
             containerInfo.Finished = time.Now()
             containerInfo.ExitCode = exitCode
             containerInfo.PID = 0
+	    containerInfo.IPAddress = ""
             container.SaveContainer(containerInfo)
             
             // Cleanup cgroup
@@ -178,12 +214,17 @@ func runContainer() {
     } else if processState != nil && !processState.Success() {
         exitCode = processState.ExitCode()
     }
+
+    if enableNetwork {
+	    network.CleanupContainerNetwork(containerID)
+    }
     
     // Update final state
     containerInfo.State = container.StateExited
     containerInfo.Finished = time.Now()
     containerInfo.ExitCode = exitCode
     containerInfo.PID = 0
+    containerInfo.IPAddress = ""
     container.SaveContainer(containerInfo)
 }
 

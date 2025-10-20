@@ -9,7 +9,7 @@ import (
     "time"
 )
 
-func RunInNewNamespaceWithCgroup(command []string, rootfsPath, containerID string) (int, error) {
+func RunInNewNamespaceWithCgroup(command []string, rootfsPath, containerID string, enableNetwork bool) (int, error) {
     if rootfsPath == "" {
         return 0, fmt.Errorf("rootfs path required")
     }
@@ -37,8 +37,13 @@ exec chroot %s %s
     
     cmd := exec.Command("/bin/bash", tmpScript)
     
+    cloneFlags := syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWNS
+    if enableNetwork {
+	    cloneFlags |= syscall.CLONE_NEWNET
+    }
+
     cmd.SysProcAttr = &syscall.SysProcAttr{
-        Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS,
+	    Cloneflags: uintptr(cloneFlags),
     }
     
     cmd.Stdin = os.Stdin
@@ -59,6 +64,6 @@ exec chroot %s %s
 }
 
 func RunInNewNamespace(command []string, rootfsPath string) error {
-    _, err := RunInNewNamespaceWithCgroup(command, rootfsPath, "")
+    _, err := RunInNewNamespaceWithCgroup(command, rootfsPath, "", true)
     return err
 }
