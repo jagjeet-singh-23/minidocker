@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+	"github.com/jagjeet-singh-23/minidocker/pkg/volume"
 )
 
 const containerStorePath = "/var/lib/minidocker/containers"
@@ -32,6 +33,7 @@ type Container struct {
     Finished    time.Time         `json:"finished"`
     LogPath     string            `json:"log_path"`
     IPAddress   string            `json:"ip_address"`
+    Mounts      []volume.Mount    `json:"mounts"`
     NetworkMode string            `json:"network_mode"`
 }
 

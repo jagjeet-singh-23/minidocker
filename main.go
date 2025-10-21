@@ -1,11 +1,14 @@
 package main
 
 import (
+    "encoding/json"
     "flag"
     "fmt"
     "os"
     "os/exec"
+    "path/filepath"
     "strconv"
+    "strings"
     "syscall"
     "text/tabwriter"
     "time"
@@ -14,19 +17,24 @@ import (
     "github.com/jagjeet-singh-23/minidocker/pkg/image"
     "github.com/jagjeet-singh-23/minidocker/pkg/namespace"
     "github.com/jagjeet-singh-23/minidocker/pkg/network"
+    "github.com/jagjeet-singh-23/minidocker/pkg/volume"
 )
 
 func main() {
     if len(os.Args) < 2 {
         fmt.Println("Usage: minidocker <command> [args...]")
         fmt.Println("Commands:")
-        fmt.Println("  run [--memory=MB] [--cpu=CORES] [--net=MODE] [-d] <image> <command>    - Run a container")
-        fmt.Println("  ps                                                                     - List containers")
-        fmt.Println("  stop <container-id>                                                    - Stop a container")
-        fmt.Println("  rm <container-id>                                                      - Remove a container")
-        fmt.Println("  logs <container-id>                                                    - Show container logs")
-        fmt.Println("  images                                                                 - List available images")
-	fmt.Println("  exec <container-id> <command>				              - Execute command in running container")
+        fmt.Println("  run [--memory=MB] [--cpu=CORES] [--net=MODE] [-d] [-v SOURCE:DEST[:ro]] <image> <command>")
+        fmt.Println("  ps                                           - List containers")
+        fmt.Println("  stop <container-id>                          - Stop a container")
+        fmt.Println("  rm <container-id>                            - Remove a container")
+        fmt.Println("  exec <container-id> <command>                - Execute in container")
+        fmt.Println("  logs <container-id>                          - Show container logs")
+        fmt.Println("  images                                       - List available images")
+        fmt.Println("  volume create <name>                         - Create a volume")
+        fmt.Println("  volume ls                                    - List volumes")
+        fmt.Println("  volume rm <name>                             - Remove a volume")
+        fmt.Println("  volume inspect <name>                        - Inspect a volume")
         os.Exit(1)
     }
 
@@ -36,17 +44,19 @@ func main() {
     case "run":
         runContainer()
     case "ps":
-	    listContainers()
+        listContainers()
     case "stop":
-	    stopContainer()
+        stopContainer()
     case "rm":
-	    removeContainer()
+        removeContainer()
+    case "exec":
+        execContainer()
     case "logs":
-    	    showLogs()
+        showLogs()
     case "images":
         listImages()
-    case "exec":
-	    execContainer()
+    case "volume":
+        handleVolumeCommand()
     default:
         fmt.Printf("Unknown command: %s\n", command)
         os.Exit(1)
@@ -60,6 +70,9 @@ func runContainer() {
     cpuCores := runCmd.Float64("cpu", 0, "CPU limit (e.g., 0.5 for half a core)")
     detach := runCmd.Bool("d", false, "Run container in background")
     networkMode := runCmd.String("net", "bridge", "Network mode (bridge or none)")
+
+    var volumeSpecs arrayFlags
+    runCmd.Var(&volumeSpecs, "v", "Volume mount (can be repeated): -v /host/path:/container/path[:ro] or -v volumename:/container/path[:ro]")
     
     runCmd.Parse(os.Args[2:])
     
@@ -85,19 +98,31 @@ func runContainer() {
         os.Exit(1)
     }
 
+    // Parse volume spefications
+    var mounts []volume.Mount
+    for _, volSpec := range volumeSpecs {
+	    mount, err := parseVolumeSpec(volSpec)
+	    if err != nil {
+		    fmt.Printf("Error parsing volume spec '%s': %v\n", volSpec, err)
+		    os.Exit(1)
+	    }
+	    mounts = append(mounts, *mount)
+    }
+
     // Create container metadata
     containerID := container.GenerateContainerID()
     logPath := fmt.Sprintf("/var/lib/minidocker/containers/%s.log", containerID)
 
     containerInfo := &container.Container{
-        ID: containerID,
-        Name: containerID,
-        Image: imageName,
-        Command: command,
-        State: container.StateCreated,
-        Created: time.Now(),
-        LogPath: logPath,
+        ID: 	     containerID,
+        Name: 	     containerID,
+        Image: 	     imageName,
+        Command:     command,
+        State:       container.StateCreated,
+        Created:     time.Now(),
+        LogPath:     logPath,
 	NetworkMode: *networkMode,
+	Mounts:      mounts,
     }
 
     if err := container.SaveContainer(containerInfo); err != nil {
@@ -131,6 +156,26 @@ func runContainer() {
 		    fmt.Printf("Error setting up bridge: %v\n", err)
 		    os.Exit(1)
 	    }
+    }
+
+    // Prepare and apply volume mounts BEFORE starting container
+    for i, mount := range mounts {
+	    sourcePath, err := volume.PrepareMount(&mount)
+	    if err != nil {
+		    fmt.Printf("Error preparing mount: %v\n", err)
+		    os.Exit(1)
+	    }
+
+	    // Apply mount to rootfs
+	    if err := applyMountToRootfs(rootfsPath, sourcePath, mount.Destination, mount.ReadOnly); err != nil {
+		    fmt.Printf("Error applying mount: %v\n", err)
+		    os.Exit(1)
+	    }
+
+	    fmt.Printf("Mounted %s to %s\n", mount.Source, mount.Destination)
+
+	    // Update mount with actial source path
+	    mounts[i].Source = sourcePath
     }
 
     // Update state to running
@@ -183,6 +228,9 @@ func runContainer() {
 	    if enableNetwork {
 		    network.CleanupContainerNetwork(containerID)
 	    }
+
+	    // Clean up mounts
+	    cleanupMounts(rootfsPath, mounts)
             
             // Update final state
             containerInfo.State = container.StateExited
@@ -218,6 +266,8 @@ func runContainer() {
     if enableNetwork {
 	    network.CleanupContainerNetwork(containerID)
     }
+
+    cleanupMounts(rootfsPath, mounts)
     
     // Update final state
     containerInfo.State = container.StateExited
@@ -399,4 +449,183 @@ func execContainer() {
 		fmt.Printf("Error executing command:  %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func handleVolumeCommand() {
+    if len(os.Args) < 3 {
+        fmt.Println("Usage: minidocker volume <subcommand>")
+        fmt.Println("Subcommands:")
+        fmt.Println("  create <name>    - Create a volume")
+        fmt.Println("  ls               - List volumes")
+        fmt.Println("  rm <name>        - Remove a volume")
+        fmt.Println("  inspect <name>   - Inspect a volume")
+        os.Exit(1)
+    }
+    
+    subcommand := os.Args[2]
+    
+    switch subcommand {
+    case "create":
+        volumeCreate()
+    case "ls":
+        volumeList()
+    case "rm":
+        volumeRemove()
+    case "inspect":
+        volumeInspect()
+    default:
+        fmt.Printf("Unknown volume subcommand: %s\n", subcommand)
+        os.Exit(1)
+    }
+}
+
+func volumeCreate() {
+	if len(os.Args) < 4 {
+		fmt.Println("Usage: minidocker volume create <name>")
+		os.Exit(1)
+	}
+
+	volumeName := os.Args[3]
+
+	vol, err := volume.CreateVolume(volumeName)
+	if err != nil {
+		fmt.Printf("Error creating volume: %v", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Volume %s created\n", vol.Name)
+}
+
+func volumeList() {
+    volumes, err := volume.ListVolumes()
+    if err != nil {
+        fmt.Printf("Error listing volumes: %v\n", err)
+        os.Exit(1)
+    }
+
+    if len(volumes) == 0 {
+        fmt.Println("No volumes found")
+        return
+    }
+
+    w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+    fmt.Fprintln(w, "VOLUME NAME\tDRIVER\tCREATED")
+
+    for _, vol := range volumes {
+        created := vol.Created.Format("2006-01-02 15:04:05")
+        fmt.Fprintf(w, "%s\t%s\t%s\n", vol.Name, vol.Driver, created)
+    }
+    w.Flush()
+}
+
+func volumeRemove() {
+    if len(os.Args) < 4 {
+        fmt.Println("Usage: minidocker volume rm <name>")
+        os.Exit(1)
+    }
+
+    volumeName := os.Args[3]
+
+    if err := volume.RemoveVolume(volumeName); err != nil {
+        fmt.Printf("Error removing volume: %v\n", err)
+        os.Exit(1)
+    }
+
+    fmt.Printf("Volume %s removed\n", volumeName)
+}
+
+func volumeInspect() {
+    if len(os.Args) < 4 {
+        fmt.Println("Usage: minidocker volume rm <name>")
+        os.Exit(1)
+    }
+
+    volumeName := os.Args[3]
+
+    vol, err := volume.GetVolume(volumeName)
+    if err != nil {
+	    fmt.Printf("Error: %v\n", err)
+	    os.Exit(1)
+    }
+
+    data, _ := json.MarshalIndent(vol, "", "  ")
+    fmt.Println(string(data))
+
+}
+
+// Custom flag type for multiple -v flags
+type arrayFlags []string
+
+func (i *arrayFlags) String() string {
+    return strings.Join(*i, ", ")
+}
+
+func (i *arrayFlags) Set(value string) error {
+    *i = append(*i, value)
+    return nil
+}
+
+// parseVolumeSpec parses volume specification: SOURCE:DEST[:ro]
+func parseVolumeSpec(spec string) (*volume.Mount, error) {
+    parts := strings.Split(spec, ":")
+
+    if len(parts) < 2 {
+        return nil, fmt.Errorf("invalid volume spec format (use SOURCE:DEST or SOURCE:DEST:ro)")
+    }
+
+    mount := &volume.Mount{
+        Source:      parts[0],
+        Destination: parts[1],
+        ReadOnly:    false,
+    }
+
+    // Determine if it's a bind mount or volume
+    if filepath.IsAbs(parts[0]) {
+        mount.Type = "bind"
+    } else {
+        mount.Type = "volume"
+    }
+
+    // Check for read-only flag
+    if len(parts) >= 3 && parts[2] == "ro" {
+        mount.ReadOnly = true
+    }
+
+    return mount, nil
+}
+
+// applyMountToRootfs performs bind mount into container rootfs
+func applyMountToRootfs(rootfsPath, sourcePath, destPath string, readOnly bool) error {
+    targetPath := filepath.Join(rootfsPath, destPath)
+
+    // Create mount point directory
+    if err := os.MkdirAll(targetPath, 0755); err != nil {
+        return fmt.Errorf("failed to create mount point: %v", err)
+    }
+
+    // Perform bind mount
+    mountCmd := []string{"mount", "--bind", sourcePath, targetPath}
+    cmd := exec.Command(mountCmd[0], mountCmd[1:]...)
+
+    if err := cmd.Run(); err != nil {
+        return fmt.Errorf("failed to bind mount: %v", err)
+    }
+
+    // Apply read-only remount if needed
+    if readOnly {
+        remountCmd := exec.Command("mount", "-o", "remount,ro,bind", targetPath)
+        if err := remountCmd.Run(); err != nil {
+            return fmt.Errorf("failed to remount as read-only: %v", err)
+        }
+    }
+
+    return nil
+}
+
+// cleanupMounts unmounts all volume mounts
+func cleanupMounts(rootfsPath string, mounts []volume.Mount) {
+    for _, mount := range mounts {
+        targetPath := filepath.Join(rootfsPath, mount.Destination)
+        exec.Command("umount", targetPath).Run()
+    }
 }

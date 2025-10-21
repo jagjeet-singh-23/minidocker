@@ -24,10 +24,15 @@ fi
 `, cgroupPath, cgroupPath)
     }
     
+    escapedCmd := make([]string, len(command))
+    for i, arg := range command {
+	    escapedCmd[i] = shellescape(arg)
+    }
+
     script := fmt.Sprintf(`#!/bin/bash
 %s
 exec chroot %s %s
-`, cgroupAdd, rootfsPath, strings.Join(command, " "))
+`, cgroupAdd, rootfsPath, strings.Join(escapedCmd, " "))
     
     tmpScript := "/tmp/container_wrapper.sh"
     if err := os.WriteFile(tmpScript, []byte(script), 0755); err != nil {
@@ -66,4 +71,8 @@ exec chroot %s %s
 func RunInNewNamespace(command []string, rootfsPath string) error {
     _, err := RunInNewNamespaceWithCgroup(command, rootfsPath, "", true)
     return err
+}
+
+func shellescape(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
