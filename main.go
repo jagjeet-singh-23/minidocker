@@ -219,36 +219,36 @@ func runContainer() {
     var containerIP string
     // Setup container network if bridge mode
     if enableNetwork {
-	    containerIP, err := network.SetupContainerNetwork(containerID, pid)
+	    ip, err := network.SetupContainerNetwork(containerID, pid)
 	    if err != nil {
 		    fmt.Printf("Warning: failed to setup network: %v\n", err)
 	    } else {
+		    containerIP = ip
 		    containerInfo.IPAddress = containerIP
 		    container.SaveContainer(containerInfo)
 		    fmt.Printf("Container network configured with IP: %s\n", containerIP)
 
 		    if len(ports) > 0 && containerIP != "" {
-			    ip := strings.Split(containerIP, "/")[0]
+			    ipAddr := strings.Split(containerIP, "/")[0]
 
 			    for _, portMapping := range ports {
 				    err := network.SetupPortForwarding(
 					    portMapping.HostPort,
 					    portMapping.ContainerPort,
-					    ip,
+					    ipAddr,
 					    portMapping.Protocol,
 				    )
 				    if err != nil {
 					    fmt.Printf("WARNING: failed to setup port forwarding %d:%d/%s: %v\n",
-						portMapping.HostPort, portMapping.ContainerPort, portMapping.Protocol, err)
+					    portMapping.HostPort, portMapping.ContainerPort, portMapping.Protocol, err)
 				    } else {
 					    fmt.Printf("Port mapping: %d -> %s:%d/%s\n",
-					    	portMapping.HostPort, ip, portMapping.ContainerPort, portMapping.Protocol)
+					    portMapping.HostPort, ipAddr, portMapping.ContainerPort, portMapping.Protocol)
 				    }
 			    }
 		    }
 	    }
     }
-    
     if *detach {
         // Detach mode - run in goroutine
         fmt.Printf("Container %s started in background with PID %d\n", containerID[:12], pid)
