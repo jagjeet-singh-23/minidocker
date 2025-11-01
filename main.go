@@ -57,6 +57,8 @@ func main() {
         listImages()
     case "volume":
         handleVolumeCommand()
+    case "port":
+	showPorts()
     default:
         fmt.Printf("Unknown command: %s\n", command)
         os.Exit(1)
@@ -72,7 +74,9 @@ func runContainer() {
     networkMode := runCmd.String("net", "bridge", "Network mode (bridge or none)")
 
     var volumeSpecs arrayFlags
+    var portSpecs arrayFlags
     runCmd.Var(&volumeSpecs, "v", "Volume mount (can be repeated): -v /host/path:/container/path[:ro] or -v volumename:/container/path[:ro]")
+    runCmd.Var(&portSpecs, "p", "Port mapping (can be repeated): -p HOST_PORT:CONTAINER_PORT[/PROTOCOL]")
     
     runCmd.Parse(os.Args[2:])
     
@@ -88,6 +92,11 @@ func runContainer() {
     // Validate network mode
     if *networkMode != "bridge" && *networkMode != "none" {
 	    fmt.Printf("Invalid network mode: %s (use 'bridge' or 'none')", *networkMode)
+	    os.Exit(1)
+    }
+
+    if len(portSpecs) > 0 && *networkMode != "bridge" {
+	    fmt.Println("Error: Port mapping requires bridge networking (--net=bridge)")
 	    os.Exit(1)
     }
 
@@ -109,6 +118,17 @@ func runContainer() {
 	    mounts = append(mounts, *mount)
     }
 
+    // Parse port specifications
+    var ports[]container.PortMapping
+    for _, portSpec := range portSpecs {
+	    portMapping, err := parsePortSpec(portSpec)
+	    if err != nil {
+		    fmt.Println("Error parsing port spec '%s': %v\n", portSpec, err)
+		    os.Exit(1)
+	    }
+	    ports = append(ports, *portMapping)
+    }
+
     // Create container metadata
     containerID := container.GenerateContainerID()
     logPath := fmt.Sprintf("/var/lib/minidocker/containers/%s.log", containerID)
@@ -123,6 +143,7 @@ func runContainer() {
         LogPath:     logPath,
 	NetworkMode: *networkMode,
 	Mounts:      mounts,
+	Ports:       ports,
     }
 
     if err := container.SaveContainer(containerInfo); err != nil {
@@ -195,6 +216,7 @@ func runContainer() {
     containerInfo.PID = pid
     container.SaveContainer(containerInfo)
 
+    var containerIP string
     // Setup container network if bridge mode
     if enableNetwork {
 	    containerIP, err := network.SetupContainerNetwork(containerID, pid)
@@ -204,6 +226,26 @@ func runContainer() {
 		    containerInfo.IPAddress = containerIP
 		    container.SaveContainer(containerInfo)
 		    fmt.Printf("Container network configured with IP: %s\n", containerIP)
+
+		    if len(ports) > 0 && containerIP != "" {
+			    ip := strings.Split(containerIP, "/")[0]
+
+			    for _, portMapping := range ports {
+				    err := network.SetupPortForwarding(
+					    portMapping.HostPort,
+					    portMapping.ContainerPort,
+					    ip,
+					    portMapping.Protocol,
+				    )
+				    if err != nil {
+					    fmt.Printf("WARNING: failed to setup port forwarding %d:%d/%s: %v\n",
+						portMapping.HostPort, portMapping.ContainerPort, portMapping.Protocol, err)
+				    } else {
+					    fmt.Printf("Port mapping: %d -> %s:%d/%s\n",
+					    	portMapping.HostPort, ip, portMapping.ContainerPort, portMapping.Protocol)
+				    }
+			    }
+		    }
 	    }
     }
     
@@ -224,10 +266,23 @@ func runContainer() {
                 exitCode = processState.ExitCode()
             }
 
+            // Cleanup port forwarding
+            if enableNetwork && containerIP != "" && len(ports) > 0 {
+                ip := strings.Split(containerIP, "/")[0]
+                for _, portMapping := range ports {
+                    network.RemovePortForwarding(
+                        portMapping.HostPort,
+                        portMapping.ContainerPort,
+                        ip,
+                        portMapping.Protocol,
+                    )
+                }
+            }
+
 	    // Cleanup network
-	    if enableNetwork {
-		    network.CleanupContainerNetwork(containerID)
-	    }
+            if enableNetwork {
+                network.CleanupContainerNetwork(containerID)
+            }
 
 	    // Clean up mounts
 	    cleanupMounts(rootfsPath, mounts)
@@ -263,6 +318,20 @@ func runContainer() {
         exitCode = processState.ExitCode()
     }
 
+    // Cleanup port forwarding
+    if enableNetwork && containerIP != "" && len(ports) > 0 {
+	    ip := strings.Split(containerIP, "/")[0]
+	    for _, portMapping := range ports {
+		    network.RemovePortForwarding(
+			    portMapping.HostPort,
+			    portMapping.ContainerPort,
+			    ip,
+			    portMapping.Protocol,
+		    )
+	    }
+    }
+
+    // Cleanup network
     if enableNetwork {
 	    network.CleanupContainerNetwork(containerID)
     }
@@ -627,5 +696,81 @@ func cleanupMounts(rootfsPath string, mounts []volume.Mount) {
     for _, mount := range mounts {
         targetPath := filepath.Join(rootfsPath, mount.Destination)
         exec.Command("umount", targetPath).Run()
+    }
+}
+
+// parsePortSpec parses port specification: HOST_PORT:CONTAINER_PORT[/PROTOCOL]
+func parsePortSpec(spec string) (*container.PortMapping, error) {
+    // Split by slash to get protocol
+    parts := strings.Split(spec, "/")
+    portPart := parts[0]
+    protocol := "tcp" // default
+
+    if len(parts) == 2 {
+        protocol = strings.ToLower(parts[1])
+        if protocol != "tcp" && protocol != "udp" {
+            return nil, fmt.Errorf("invalid protocol: %s (use tcp or udp)", protocol)
+        }
+    }
+
+    // Split port part by colon
+    portParts := strings.Split(portPart, ":")
+    if len(portParts) != 2 {
+        return nil, fmt.Errorf("invalid port format (use HOST_PORT:CONTAINER_PORT)")
+    }
+
+    hostPort, err := strconv.Atoi(portParts[0])
+    if err != nil {
+        return nil, fmt.Errorf("invalid host port: %s", portParts[0])
+    }
+
+    containerPort, err := strconv.Atoi(portParts[1])
+    if err != nil {
+        return nil, fmt.Errorf("invalid container port: %s", portParts[1])
+    }
+
+    if err := network.ValidatePort(hostPort); err != nil {
+        return nil, fmt.Errorf("host port: %v", err)
+    }
+
+    if err := network.ValidatePort(containerPort); err != nil {
+        return nil, fmt.Errorf("container port: %v", err)
+    }
+
+    // Check if host port is available
+    if !network.CheckPortAvailable(hostPort) {
+        return nil, fmt.Errorf("host port %d is already in use", hostPort)
+    }
+
+    return &container.PortMapping{
+        HostPort:      hostPort,
+        ContainerPort: containerPort,
+        Protocol:      protocol,
+    }, nil
+}
+
+func showPorts() {
+    if len(os.Args) < 3 {
+        fmt.Println("Usage: minidocker port <container-id>")
+        os.Exit(1)
+    }
+    
+    containerID := os.Args[2]
+    containerInfo, err := container.FindContainerByPrefix(containerID)
+    if err != nil {
+        fmt.Printf("Error: %v\n", err)
+        os.Exit(1)
+    }
+    
+    if len(containerInfo.Ports) == 0 {
+        fmt.Println("No port mappings")
+        return
+    }
+    
+    fmt.Println("PORT MAPPINGS:")
+    for _, port := range containerInfo.Ports {
+        fmt.Printf("%d/%s -> %s:%d\n",
+            port.HostPort, port.Protocol,
+            strings.Split(containerInfo.IPAddress, "/")[0], port.ContainerPort)
     }
 }

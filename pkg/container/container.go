@@ -20,21 +20,28 @@ const (
 	StateExited  ContainerState  = "exited"
 )
 
+type PortMapping struct {
+	HostPort 	int    `json:"host_port"`
+	ContainerPort 	int    `json:"container_port"`
+	Protocol        string `json:"protocol"`
+}
+
 type Container struct {
-    ID          string            `json:"id"`
-    Name        string            `json:"name"`
-    Image       string            `json:"image"`
-    Command     []string          `json:"command"`
-    State       ContainerState    `json:"state"`
-    PID         int               `json:"pid"`
-    ExitCode    int               `json:"exit_code"`
-    Created     time.Time         `json:"created"`
-    Started     time.Time         `json:"started"`
-    Finished    time.Time         `json:"finished"`
-    LogPath     string            `json:"log_path"`
-    IPAddress   string            `json:"ip_address"`
-    Mounts      []volume.Mount    `json:"mounts"`
-    NetworkMode string            `json:"network_mode"`
+    ID           string            `json:"id"`
+    Name         string            `json:"name"`
+    Image        string            `json:"image"`
+    Command      []string          `json:"command"`
+    State        ContainerState    `json:"state"`
+    PID          int               `json:"pid"`
+    ExitCode     int               `json:"exit_code"`
+    Created      time.Time         `json:"created"`
+    Started      time.Time         `json:"started"`
+    Finished     time.Time         `json:"finished"`
+    LogPath      string            `json:"log_path"`
+    IPAddress    string            `json:"ip_address"`
+    Mounts       []volume.Mount    `json:"mounts"`
+    NetworkMode  string            `json:"network_mode"`
+    Ports        []PortMapping     `json:"ports"`
 }
 
 // SaveContainer persists container metadata
