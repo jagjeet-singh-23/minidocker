@@ -47,6 +47,11 @@ func SetupBridge() error {
         return fmt.Errorf("failed to enable IP forwarding: %v", err)
     }
 
+    // Enable route_localnet for localhost port forwarding (ADD THIS)
+    if err := exec.Command("sysctl", "-w", "net.ipv4.conf.all.route_localnet=1").Run(); err != nil {
+	    return fmt.Errorf("failed to enable route_localnet: %v", err)
+    }
+
     // Setup NAT (check if rule already exists)
     if err := setupNAT(); err != nil {
         // Ignore if rule already exists

@@ -18,6 +18,8 @@ import (
     "github.com/jagjeet-singh-23/minidocker/pkg/namespace"
     "github.com/jagjeet-singh-23/minidocker/pkg/network"
     "github.com/jagjeet-singh-23/minidocker/pkg/volume"
+    "github.com/jagjeet-singh-23/minidocker/pkg/layer"
+    "github.com/jagjeet-singh-23/minidocker/pkg/overlay"
 )
 
 func main() {
@@ -35,6 +37,11 @@ func main() {
         fmt.Println("  volume ls                                    - List volumes")
         fmt.Println("  volume rm <name>                             - Remove a volume")
         fmt.Println("  volume inspect <name>                        - Inspect a volume")
+        fmt.Println("  layer create <dir> [comment]                 - Create a layer")
+        fmt.Println("  layer ls                                     - List layers")
+        fmt.Println("  layer inspect <id>                           - Inspect a layer")
+        fmt.Println("  layer rm <id>                                - Remove a layer")
+        fmt.Println("  build <name> <layer-id1> [layer-id2...]      - Build image from layers")
         os.Exit(1)
     }
 
@@ -59,6 +66,10 @@ func main() {
         handleVolumeCommand()
     case "port":
 	showPorts()
+    case "layer":
+        handleLayerCommand()
+    case "build":
+        buildImage()
     default:
         fmt.Printf("Unknown command: %s\n", command)
         os.Exit(1)
@@ -101,12 +112,63 @@ func runContainer() {
     }
 
     // Get image rootfs path
-    rootfsPath, err := image.GetImageRootfs(imageName)
-    if err != nil {
-        fmt.Printf("Error: %v\n", err)
-        os.Exit(1)
-    }
+    var rootfsPath string
+    var overlayMount *overlay.OverlayMount
+    var isLayered bool
+    var containerID string
 
+    if image.IsLayeredImage(imageName) {
+	    // Layered image - use OverlayFS
+	    isLayered = true
+
+	    // Get image manifest
+	    manifest, err := image.GetImageManifest(imageName)
+	    if err != nil {
+		    fmt.Printf("Error loading image manifest: %v\n", err)
+		    os.Exit(1)
+	    }
+
+	    fmt.Printf("Using layered image with %d layers\n", len(manifest.Layers))
+
+	    // Get layer paths
+	    var layerPaths []string
+	    for _, layerID := range manifest.Layers {
+		    l, err := layer.GetLayer(layerID)
+		    if err != nil {
+			    fmt.Printf("Error: layer %s not found: %v\n", layerID, err)
+			    os.Exit(1)
+		    }
+		    layerPaths = append(layerPaths, l.Path)
+	    }
+
+	    // Create container ID first (we need it for overlay)
+	    containerID = container.GenerateContainerID()
+
+	    // Create overlay mount
+	    overlayMount, err = overlay.CreateOverlay(containerID, layerPaths)
+	    if err != nil {
+		    fmt.Printf("Error creating overlay: %v\n", err)
+		    os.Exit(1)
+	    }
+
+	    // Use merged directory as rootfs
+	    rootfsPath = overlayMount.MergedDir
+
+	    fmt.Printf("Overlay filesystem mounted at %s\n", rootfsPath)
+
+    } else {
+	    // Non-layered image - use direct rootfs
+	    var err error
+	    rootfsPath, err = image.GetImageRootfs(imageName)
+	    if err != nil {
+		    fmt.Printf("Error: %v\n", err)
+		    os.Exit(1)
+	    }
+
+	    // Generate container ID for non-layered image
+	    containerID = container.GenerateContainerID()
+    }
+    
     // Parse volume spefications
     var mounts []volume.Mount
     for _, volSpec := range volumeSpecs {
@@ -130,7 +192,6 @@ func runContainer() {
     }
 
     // Create container metadata
-    containerID := container.GenerateContainerID()
     logPath := fmt.Sprintf("/var/lib/minidocker/containers/%s.log", containerID)
 
     containerInfo := &container.Container{
@@ -286,7 +347,10 @@ func runContainer() {
 
 	    // Clean up mounts
 	    cleanupMounts(rootfsPath, mounts)
-            
+	    if isLayered && overlayMount != nil {
+		    overlay.CleanupOverlay(containerID)
+	    }
+           
             // Update final state
             containerInfo.State = container.StateExited
             containerInfo.Finished = time.Now()
@@ -337,6 +401,9 @@ func runContainer() {
     }
 
     cleanupMounts(rootfsPath, mounts)
+    if isLayered && overlayMount != nil {
+	    overlay.CleanupOverlay(containerInfo.ID)
+    }
     
     // Update final state
     containerInfo.State = container.StateExited
@@ -773,4 +840,187 @@ func showPorts() {
             port.HostPort, port.Protocol,
             strings.Split(containerInfo.IPAddress, "/")[0], port.ContainerPort)
     }
+}
+
+func handleLayerCommand() {
+    if len(os.Args) < 3 {
+        fmt.Println("Usage: minidocker layer <subcommand>")
+        fmt.Println("Subcommands:")
+        fmt.Println("  create <source-dir> [comment]  - Create a layer from directory")
+        fmt.Println("  ls                             - List all layers")
+        fmt.Println("  inspect <layer-id>             - Inspect a layer")
+        fmt.Println("  rm <layer-id>                  - Remove a layer")
+        os.Exit(1)
+    }
+
+    subcommand := os.Args[2]
+
+    switch subcommand {
+    case "create":
+        layerCreate()
+    case "ls":
+        layerList()
+    case "inspect":
+        layerInspect()
+    case "rm":
+        layerRemove()
+    default:
+        fmt.Printf("Unknown layer subcommand: %s\n", subcommand)
+        os.Exit(1)
+    }
+}
+
+func layerCreate() {
+    if len(os.Args) < 4 {
+        fmt.Println("Usage: minidocker layer create <source-dir> [comment]")
+        os.Exit(1)
+    }
+
+    sourceDir := os.Args[3]
+    comment := ""
+    if len(os.Args) >= 5 {
+        comment = strings.Join(os.Args[4:], " ")
+    }
+
+    // Check if source directory exists
+    if _, err := os.Stat(sourceDir); os.IsNotExist(err) {
+        fmt.Printf("Error: source directory %s does not exist\n", sourceDir)
+        os.Exit(1)
+    }
+
+    fmt.Printf("Creating layer from %s...\n", sourceDir)
+
+    // Create layer
+    createdBy := fmt.Sprintf("manual: %s", sourceDir)
+    newLayer, err := layer.CreateLayer(sourceDir, createdBy, comment)
+    if err != nil {
+        fmt.Printf("Error creating layer: %v\n", err)
+        os.Exit(1)
+    }
+
+    fmt.Printf("Layer created successfully!\n")
+    fmt.Printf("Layer ID: %s\n", newLayer.ID)
+    fmt.Printf("Size: %d bytes (%.2f MB)\n", newLayer.Size, float64(newLayer.Size)/(1024*1024))
+    if comment != "" {
+        fmt.Printf("Comment: %s\n", comment)
+    }
+}
+
+func layerList() {
+    layers, err := layer.ListLayers()
+    if err != nil {
+        fmt.Printf("Error listing layers: %v\n", err)
+        os.Exit(1)
+    }
+
+    if len(layers) == 0 {
+        fmt.Println("No layers found")
+        return
+    }
+
+    w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+    fmt.Fprintln(w, "LAYER ID\tSIZE\tCREATED\tCOMMENT")
+
+    for _, l := range layers {
+        created := l.Created.Format("2006-01-02 15:04:05")
+        sizeMB := fmt.Sprintf("%.2f MB", float64(l.Size)/(1024*1024))
+        layerID := l.ID
+        if len(layerID) > 12 {
+            layerID = layerID[:12]
+        }
+
+        comment := l.Comment
+        if comment == "" {
+            comment = "-"
+        }
+        if len(comment) > 30 {
+            comment = comment[:27] + "..."
+        }
+
+        fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", layerID, sizeMB, created, comment)
+    }
+    w.Flush()
+}
+
+func layerInspect() {
+    if len(os.Args) < 4 {
+        fmt.Println("Usage: minidocker layer inspect <layer-id>")
+        os.Exit(1)
+    }
+
+    layerID := os.Args[3]
+
+    l, err := layer.GetLayerOrPrefix(layerID)
+    if err != nil {
+        fmt.Printf("Error: %v\n", err)
+        os.Exit(1)
+    }
+
+    data, _ := json.MarshalIndent(l, "", "  ")
+    fmt.Println(string(data))
+}
+
+func layerRemove() {
+    if len(os.Args) < 4 {
+        fmt.Println("Usage: minidocker layer rm <layer-id>")
+        os.Exit(1)
+    }
+
+    layerID := os.Args[3]
+
+    // Get full layer ID from prefix
+    l, err := layer.GetLayerOrPrefix(layerID)
+    if err != nil {
+        fmt.Printf("Error: %v\n", err)
+        os.Exit(1)
+    }
+
+    if err := layer.RemoveLayer(l.ID); err != nil {
+        fmt.Printf("Error removing layer: %v\n", err)
+        os.Exit(1)
+    }
+
+    fmt.Printf("Layer %s removed\n", l.ID[:12])
+}
+
+func buildImage() {
+    if len(os.Args) < 4 {
+        fmt.Println("Usage: minidocker build <image-name> <layer-id1> [layer-id2] ...")
+        fmt.Println("Example: minidocker build myapp abc123 def456 ghi789")
+        os.Exit(1)
+    }
+
+    imageName := os.Args[2]
+    layerPrefixes := os.Args[3:]
+
+    fmt.Printf("Building image '%s' from %d layers...\n", imageName, len(layerPrefixes))
+
+    // Verify all layers exist and get full IDs
+    var layerIDs []string
+    for _, prefix := range layerPrefixes {
+        l, err := layer.GetLayerOrPrefix(prefix)
+        if err != nil {
+            fmt.Printf("Error: layer %s not found\n", prefix)
+            os.Exit(1)
+        }
+        layerIDs = append(layerIDs, l.ID)
+        fmt.Printf("  Layer %s: %s\n", prefix, l.Comment)
+    }
+
+    // Create image manifest
+    config := image.ImageConfig{
+        Cmd:        []string{"/bin/bash"},
+        Env:        []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+        WorkingDir: "/",
+    }
+
+    manifest, err := image.CreateImageFromLayers(imageName, "latest", layerIDs, config)
+    if err != nil {
+        fmt.Printf("Error creating image: %v\n", err)
+        os.Exit(1)
+    }
+
+    fmt.Printf("Image '%s' created successfully!\n", imageName)
+    fmt.Printf("Layers: %d\n", len(manifest.Layers))
+    fmt.Printf("Created: %s\n", manifest.Created.Format("2006-01-02 15:04:05"))
 }
