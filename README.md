@@ -27,5 +27,3 @@ This project taught me:
 - Why OverlayFS enables efficient image storage
 - How Docker networking really works (veth pairs, bridges, NAT)
 - The beauty of Linux kernel features working together
-
-[Continue with installation, usage, etc.]
