@@ -9,7 +9,7 @@ import (
     "time"
 )
 
-func RunInNewNamespaceWithCgroup(command []string, rootfsPath, containerID string, enableNetwork bool) (int, error) {
+func RunInNewNamespaceWithCgroup(command []string, rootfsPath, containerID string, enableNetwork bool, env []string, workingDir string) (int, error) {
     if rootfsPath == "" {
         return 0, fmt.Errorf("rootfs path required")
     }
@@ -24,15 +24,30 @@ fi
 `, cgroupPath, cgroupPath)
     }
     
+    // Build environment variables for the script
+    envVars := ""
+    for _, e := range env {
+        // Export each environment variable
+        envVars += fmt.Sprintf("export %s\n", shellescape(e))
+    }
+    
+    // Set working directory (default to / if not specified)
+    if workingDir == "" {
+        workingDir = "/"
+    }
+    
+    // Escape command arguments
     escapedCmd := make([]string, len(command))
     for i, arg := range command {
-	    escapedCmd[i] = shellescape(arg)
+        escapedCmd[i] = shellescape(arg)
     }
 
+    // Build the script with env vars and working directory
     script := fmt.Sprintf(`#!/bin/bash
 %s
-exec chroot %s %s
-`, cgroupAdd, rootfsPath, strings.Join(escapedCmd, " "))
+%s
+exec chroot %s /bin/sh -c 'cd %s && exec %s'
+`, cgroupAdd, envVars, rootfsPath, shellescape(workingDir), strings.Join(escapedCmd, " "))
     
     tmpScript := "/tmp/container_wrapper.sh"
     if err := os.WriteFile(tmpScript, []byte(script), 0755); err != nil {
@@ -44,11 +59,11 @@ exec chroot %s %s
     
     cloneFlags := syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWNS
     if enableNetwork {
-	    cloneFlags |= syscall.CLONE_NEWNET
+        cloneFlags |= syscall.CLONE_NEWNET
     }
 
     cmd.SysProcAttr = &syscall.SysProcAttr{
-	    Cloneflags: uintptr(cloneFlags),
+        Cloneflags: uintptr(cloneFlags),
     }
     
     cmd.Stdin = os.Stdin
@@ -69,10 +84,10 @@ exec chroot %s %s
 }
 
 func RunInNewNamespace(command []string, rootfsPath string) error {
-    _, err := RunInNewNamespaceWithCgroup(command, rootfsPath, "", true)
+    _, err := RunInNewNamespaceWithCgroup(command, rootfsPath, "", true, []string{}, "/")
     return err
 }
 
 func shellescape(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+    return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }

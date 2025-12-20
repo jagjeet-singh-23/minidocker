@@ -26,7 +26,16 @@ func main() {
     if len(os.Args) < 2 {
         fmt.Println("Usage: minidocker <command> [args...]")
         fmt.Println("Commands:")
-        fmt.Println("  run [--memory=MB] [--cpu=CORES] [--net=MODE] [-d] [-v SOURCE:DEST[:ro]] <image> <command>")
+	fmt.Println("  run [options] <image> <command>")
+	fmt.Println("    Options:")
+	fmt.Println("      --memory=MB            Memory limit")
+	fmt.Println("      --cpu=CORES            CPU limit")
+	fmt.Println("      --net=MODE             Network mode (bridge/none)")
+	fmt.Println("      -d                     Detached mode")
+	fmt.Println("      -v SRC:DEST[:ro]       Volume mount")
+	fmt.Println("      -p HOST:CONTAINER      Port mapping")
+	fmt.Println("      -e KEY=VALUE           Environment variable")
+	fmt.Println("      -w PATH                Working directory")
         fmt.Println("  ps                                           - List containers")
         fmt.Println("  stop <container-id>                          - Stop a container")
         fmt.Println("  rm <container-id>                            - Remove a container")
@@ -42,6 +51,7 @@ func main() {
         fmt.Println("  layer inspect <id>                           - Inspect a layer")
         fmt.Println("  layer rm <id>                                - Remove a layer")
         fmt.Println("  build <name> <layer-id1> [layer-id2...]      - Build image from layers")
+	fmt.Println("  commit <container-id> <new-image-name>       - Create image from container")
         os.Exit(1)
     }
 
@@ -70,6 +80,8 @@ func main() {
         handleLayerCommand()
     case "build":
         buildImage()
+    case "commit":
+	commitContainer()
     default:
         fmt.Printf("Unknown command: %s\n", command)
         os.Exit(1)
@@ -88,6 +100,10 @@ func runContainer() {
     var portSpecs arrayFlags
     runCmd.Var(&volumeSpecs, "v", "Volume mount (can be repeated): -v /host/path:/container/path[:ro] or -v volumename:/container/path[:ro]")
     runCmd.Var(&portSpecs, "p", "Port mapping (can be repeated): -p HOST_PORT:CONTAINER_PORT[/PROTOCOL]")
+
+    var envVars arrayFlags
+    runCmd.Var(&envVars, "e", "Environment variable: -e KEY=VALUE")
+    workingDir := runCmd.String("w", "", "Working directory inside container")
     
     runCmd.Parse(os.Args[2:])
     
@@ -205,6 +221,8 @@ func runContainer() {
 	NetworkMode: *networkMode,
 	Mounts:      mounts,
 	Ports:       ports,
+	Env:         envVars,
+	WorkingDir:  *workingDir,
     }
 
     if err := container.SaveContainer(containerInfo); err != nil {
@@ -266,7 +284,7 @@ func runContainer() {
     container.SaveContainer(containerInfo)
 
     // Run container and capture PID
-    pid, err := namespace.RunInNewNamespaceWithCgroup(command, rootfsPath, containerID, enableNetwork)
+    pid, err := namespace.RunInNewNamespaceWithCgroup(command, rootfsPath, containerID, enableNetwork, containerInfo.Env, containerInfo.WorkingDir)
     
     if err != nil {
         fmt.Printf("Error starting container: %v\n", err)
@@ -347,9 +365,9 @@ func runContainer() {
 
 	    // Clean up mounts
 	    cleanupMounts(rootfsPath, mounts)
-	    if isLayered && overlayMount != nil {
-		    overlay.CleanupOverlay(containerID)
-	    }
+	    // if isLayered && overlayMount != nil {
+	    //         overlay.CleanupOverlay(containerID)
+	    // }
            
             // Update final state
             containerInfo.State = container.StateExited
@@ -402,7 +420,7 @@ func runContainer() {
 
     cleanupMounts(rootfsPath, mounts)
     if isLayered && overlayMount != nil {
-	    overlay.CleanupOverlay(containerInfo.ID)
+            overlay.CleanupOverlay(containerInfo.ID)
     }
     
     // Update final state
@@ -496,6 +514,8 @@ func removeContainer() {
 
 	// Clean up resources
 	cgroup.RemoveCgroup(containerID)
+
+	overlay.CleanupOverlay(containerInfo.ID)
 
 	fmt.Printf("Container %s removed\n", containerID)
 }
@@ -1023,4 +1043,135 @@ func buildImage() {
     fmt.Printf("Image '%s' created successfully!\n", imageName)
     fmt.Printf("Layers: %d\n", len(manifest.Layers))
     fmt.Printf("Created: %s\n", manifest.Created.Format("2006-01-02 15:04:05"))
+}
+
+func commitContainer() {
+    if len(os.Args) < 4 {
+        fmt.Println("Usage: minidocker commit <container-id> <new-image-name>")
+        fmt.Println("Example: minidocker commit c1234567 ubuntu-modified")
+        os.Exit(1)
+    }
+    
+    containerPrefix := os.Args[2]
+    newImageName := os.Args[3]
+    
+    // Find container
+    containerInfo, err := container.FindContainerByPrefix(containerPrefix)
+    if err != nil {
+        fmt.Printf("Error: %v\n", err)
+        os.Exit(1)
+    }
+    
+    fmt.Printf("Committing container %s to image %s...\n", containerInfo.ID[:12], newImageName)
+    
+    // Check if image already exists
+    if image.ImageExists(newImageName) {
+        fmt.Printf("Error: image %s already exists\n", newImageName)
+        os.Exit(1)
+    }
+    
+    // Get the original image's layers (if it's a layered image)
+    var baseLayers []string
+    var isLayered bool
+    
+    if image.IsLayeredImage(containerInfo.Image) {
+        isLayered = true
+        manifest, err := image.GetImageManifest(containerInfo.Image)
+        if err != nil {
+            fmt.Printf("Error loading base image manifest: %v\n", err)
+            os.Exit(1)
+        }
+        baseLayers = manifest.Layers
+        fmt.Printf("Base image has %d layers\n", len(baseLayers))
+    } else {
+        // Non-layered image - we need to create a layer from it first
+        fmt.Println("Base image is non-layered, creating base layer...")
+        baseRootfs, err := image.GetImageRootfs(containerInfo.Image)
+        if err != nil {
+            fmt.Printf("Error: %v\n", err)
+            os.Exit(1)
+        }
+        
+        // Create a layer from the base image
+        baseLayer, err := layer.CreateLayer(baseRootfs, 
+            fmt.Sprintf("base: %s", containerInfo.Image),
+            fmt.Sprintf("Base layer from %s", containerInfo.Image))
+        if err != nil {
+            fmt.Printf("Error creating base layer: %v\n", err)
+            os.Exit(1)
+        }
+        baseLayers = []string{baseLayer.ID}
+        fmt.Printf("Created base layer: %s\n", baseLayer.ID[:12])
+        isLayered = true
+    }
+
+    fmt.Printf("=========\n\n{%s}\n\n========", isLayered)
+    
+    // Check if container has changes (upperdir/diff)
+    overlayPath := filepath.Join("/var/lib/minidocker/overlay", containerInfo.ID, "diff")
+    
+    // Check if diff directory exists and has content
+    diffExists := false
+    if info, err := os.Stat(overlayPath); err == nil && info.IsDir() {
+        // Check if directory has files
+        entries, _ := os.ReadDir(overlayPath)
+        diffExists = len(entries) > 0
+    }
+    
+    if !diffExists {
+        fmt.Println("Warning: Container has no changes in overlay diff directory")
+        fmt.Println("Creating image without changes layer...")
+        
+        // Just create image with existing layers
+        config := image.ImageConfig{
+            Cmd:        containerInfo.Command,
+            Env:        containerInfo.Env,
+            WorkingDir: containerInfo.WorkingDir,
+        }
+        
+        _, err := image.CreateImageFromLayers(newImageName, "latest", baseLayers, config)
+        if err != nil {
+            fmt.Printf("Error creating image: %v\n", err)
+            os.Exit(1)
+        }
+        
+        fmt.Printf("Image %s created (no changes)\n", newImageName)
+        return
+    }
+    
+    // Create a new layer from the container's changes (diff directory)
+    fmt.Println("Creating layer from container changes...")
+    changeLayer, err := layer.CreateLayer(overlayPath,
+        fmt.Sprintf("commit: %s", containerInfo.ID[:12]),
+        fmt.Sprintf("Changes from container %s", containerInfo.ID[:12]))
+    if err != nil {
+        fmt.Printf("Error creating change layer: %v\n", err)
+        os.Exit(1)
+    }
+    
+    fmt.Printf("Change layer created: %s (%.2f MB)\n", 
+        changeLayer.ID[:12], 
+        float64(changeLayer.Size)/(1024*1024))
+    
+    // Build new image with base layers + change layer
+    newLayers := append(baseLayers, changeLayer.ID)
+    
+    // Create image config (preserve container settings)
+    config := image.ImageConfig{
+        Cmd:        containerInfo.Command,
+        Env:        containerInfo.Env,
+        WorkingDir: containerInfo.WorkingDir,
+    }
+    
+    manifest, err := image.CreateImageFromLayers(newImageName, "latest", newLayers, config)
+    if err != nil {
+        fmt.Printf("Error creating image: %v\n", err)
+        os.Exit(1)
+    }
+    
+    fmt.Printf("\nImage '%s' created successfully!\n", newImageName)
+    fmt.Printf("Total layers: %d\n", len(manifest.Layers))
+    fmt.Printf("  Base layers: %d\n", len(baseLayers))
+    fmt.Printf("  Change layer: 1\n")
+    fmt.Printf("\nYou can now run: sudo ./minidocker run %s <command>\n", newImageName)
 }

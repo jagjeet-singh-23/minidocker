@@ -42,6 +42,8 @@ type Container struct {
     Mounts       []volume.Mount    `json:"mounts"`
     NetworkMode  string            `json:"network_mode"`
     Ports        []PortMapping     `json:"ports"`
+    Env          []string          `json:"env"`
+    WorkingDir   string		   `json:"working_dir"`
 }
 
 // SaveContainer persists container metadata
